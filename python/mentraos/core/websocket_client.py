@@ -4,12 +4,21 @@ import asyncio
 import json
 from typing import Optional, Callable, Any, Dict
 from datetime import datetime
+from enum import Enum
 import websockets
 from websockets.client import WebSocketClientProtocol
 from websockets.exceptions import WebSocketException
 
 from ..utils.logger import get_logger
 from .exceptions import ConnectionError
+
+
+class EnumEncoder(json.JSONEncoder):
+    """JSON encoder that handles Enum values."""
+    def default(self, obj):
+        if isinstance(obj, Enum):
+            return obj.value
+        return super().default(obj)
 
 
 logger = get_logger("websocket_client")
@@ -119,7 +128,7 @@ class WebSocketClient:
                 )
                 
                 if self.is_connected:
-                    message_str = json.dumps(message)
+                    message_str = json.dumps(message, cls=EnumEncoder)
                     logger.trace(f"WS → {message}")
                     await self._websocket.send(message_str)
                 else:

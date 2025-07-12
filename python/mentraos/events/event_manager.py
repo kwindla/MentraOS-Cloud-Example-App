@@ -76,13 +76,13 @@ class EventManager:
             event_type = message.get("type", "")
             
             # Create specific event types
-            if event_type == EventType.AUDIO_CHUNK:
+            if event_type == EventType.AUDIO_CHUNK.value:
                 event = AudioChunkEvent.from_message(message, session_id)
-            elif event_type == EventType.TRANSCRIPTION:
+            elif event_type == EventType.TRANSCRIPTION.value:
                 event = TranscriptionEvent.from_message(message, session_id)
-            elif event_type == EventType.TRANSLATION:
+            elif event_type == EventType.TRANSLATION.value:
                 event = TranslationEvent.from_message(message, session_id)
-            elif event_type == EventType.BATTERY_UPDATE:
+            elif event_type == EventType.BATTERY_UPDATE.value:
                 event = BatteryUpdateEvent.from_message(message, session_id)
             else:
                 # Generic event for unknown types
@@ -144,6 +144,21 @@ class EventManager:
             logger.debug("Cleared all handlers")
     
     # Convenience methods for common events
+    def on_event(self, handler: Callable[[Event], Any]) -> Callable[[], None]:
+        """Register handler for all events."""
+        # Register for all event types
+        unregister_funcs = []
+        for event_type in EventType:
+            unregister = self.on(event_type, handler)
+            unregister_funcs.append(unregister)
+        
+        # Return a function that unregisters all
+        def unregister_all():
+            for func in unregister_funcs:
+                func()
+        
+        return unregister_all
+    
     def on_audio_chunk(self, handler: Callable[[AudioChunkEvent], Any]) -> Callable[[], None]:
         """Register handler for audio chunk events."""
         return self.on(EventType.AUDIO_CHUNK, handler)

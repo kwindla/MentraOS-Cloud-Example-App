@@ -20,7 +20,7 @@ def get_logger(name: Optional[str] = None):
         logger.add(
             sys.stdout,
             format="[{time:YYYY-MM-DD HH:mm:ss.SSS Z}] {level}: {message}",
-            level="DEBUG",
+            level="TRACE",
             colorize=True,
             serialize=False
         )

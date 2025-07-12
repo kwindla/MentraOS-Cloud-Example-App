@@ -218,7 +218,7 @@ class AppSession:
         """Handle binary audio chunk."""
         # Create audio chunk event
         await self.events.emit_from_message({
-            "type": EventType.AUDIO_CHUNK,
+            "type": EventType.AUDIO_CHUNK.value,
             "data": audio_data,
             "sessionId": self.session_id
         }, self.session_id)

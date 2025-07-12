@@ -6,6 +6,26 @@ from datetime import datetime
 from enum import Enum
 
 
+def convert_to_dict(obj: Any) -> Dict[str, Any]:
+    """Convert dataclass to dictionary, handling enums properly."""
+    if hasattr(obj, '__dataclass_fields__'):
+        result = {}
+        for field_name, field_def in obj.__dataclass_fields__.items():
+            value = getattr(obj, field_name)
+            if isinstance(value, Enum):
+                result[field_name] = value.value
+            elif isinstance(value, list):
+                result[field_name] = [v.value if isinstance(v, Enum) else convert_to_dict(v) if hasattr(v, '__dataclass_fields__') else v for v in value]
+            elif hasattr(value, '__dataclass_fields__'):
+                result[field_name] = convert_to_dict(value)
+            elif isinstance(value, dict):
+                result[field_name] = {k: (v.value if isinstance(v, Enum) else v) for k, v in value.items()}
+            elif value is not None:
+                result[field_name] = value
+        return result
+    return obj
+
+
 class MessageType(str, Enum):
     """WebSocket message types."""
     # Connection
@@ -56,9 +76,7 @@ class Message:
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert message to dictionary for sending."""
-        data = asdict(self)
-        # Remove None values
-        return {k: v for k, v in data.items() if v is not None}
+        return convert_to_dict(self)
 
 
 @dataclass
@@ -72,8 +90,7 @@ class ConnectionInitMessage:
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert message to dictionary for sending."""
-        data = asdict(self)
-        return {k: v for k, v in data.items() if v is not None}
+        return convert_to_dict(self)
 
 
 @dataclass
@@ -88,8 +105,7 @@ class ConnectionAckMessage:
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert message to dictionary for sending."""
-        data = asdict(self)
-        return {k: v for k, v in data.items() if v is not None}
+        return convert_to_dict(self)
 
 
 @dataclass
@@ -103,8 +119,7 @@ class SubscriptionUpdateMessage:
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert message to dictionary for sending."""
-        data = asdict(self)
-        return {k: v for k, v in data.items() if v is not None}
+        return convert_to_dict(self)
 
 
 @dataclass
@@ -143,8 +158,7 @@ class AudioChunkMessage:
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert message to dictionary for sending."""
-        data = asdict(self)
-        return {k: v for k, v in data.items() if v is not None}
+        return convert_to_dict(self)
 
 
 @dataclass
@@ -160,8 +174,7 @@ class TranscriptionMessage:
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert message to dictionary for sending."""
-        data = asdict(self)
-        return {k: v for k, v in data.items() if v is not None}
+        return convert_to_dict(self)
 
 
 @dataclass
@@ -177,8 +190,7 @@ class TranslationMessage:
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert message to dictionary for sending."""
-        data = asdict(self)
-        return {k: v for k, v in data.items() if v is not None}
+        return convert_to_dict(self)
 
 
 @dataclass
@@ -192,8 +204,7 @@ class BatteryUpdateMessage:
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert message to dictionary for sending."""
-        data = asdict(self)
-        return {k: v for k, v in data.items() if v is not None}
+        return convert_to_dict(self)
 
 
 @dataclass
@@ -208,8 +219,7 @@ class ErrorMessage:
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert message to dictionary for sending."""
-        data = asdict(self)
-        return {k: v for k, v in data.items() if v is not None}
+        return convert_to_dict(self)
 
 
 def parse_message(data: Dict[str, Any]) -> Message:
