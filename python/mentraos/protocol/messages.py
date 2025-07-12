@@ -85,7 +85,7 @@ class ConnectionInitMessage:
     sessionId: str
     packageName: str
     apiKey: str
-    type: str = field(default=MessageType.TPA_CONNECTION_INIT, init=False)
+    type: str = field(default_factory=lambda: MessageType.TPA_CONNECTION_INIT.value, init=False)
     timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
     
     def to_dict(self) -> Dict[str, Any]:
@@ -97,7 +97,7 @@ class ConnectionInitMessage:
 class ConnectionAckMessage:
     """Connection acknowledgment message."""
     sessionId: str
-    type: str = field(default=MessageType.TPA_CONNECTION_ACK, init=False)
+    type: str = field(default_factory=lambda: MessageType.TPA_CONNECTION_ACK.value, init=False)
     timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
     success: bool = True
     mentraosSettings: Optional[Dict[str, Any]] = None
@@ -114,7 +114,7 @@ class SubscriptionUpdateMessage:
     packageName: str
     subscriptions: List[str]
     sessionId: str
-    type: str = field(default=MessageType.SUBSCRIPTION_UPDATE, init=False)
+    type: str = field(default_factory=lambda: MessageType.SUBSCRIPTION_UPDATE.value, init=False)
     timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
     
     def to_dict(self) -> Dict[str, Any]:
@@ -126,7 +126,7 @@ class SubscriptionUpdateMessage:
 class TextWallLayout:
     """Text wall layout configuration."""
     text: str
-    layoutType: str = LayoutType.TEXT_WALL
+    layoutType: str = field(default_factory=lambda: LayoutType.TEXT_WALL.value)
 
 
 @dataclass
@@ -134,9 +134,9 @@ class DisplayEventMessage:
     """Display event message."""
     sessionId: str
     packageName: str
-    type: str = field(default=MessageType.DISPLAY_EVENT, init=False)
+    type: str = field(default_factory=lambda: MessageType.DISPLAY_EVENT.value, init=False)
     timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
-    view: str = ViewType.MAIN
+    view: str = field(default_factory=lambda: ViewType.MAIN.value)
     layout: Union[TextWallLayout, Dict[str, Any]] = field(default_factory=dict)
     durationMs: Optional[int] = None
     
@@ -152,7 +152,7 @@ class DisplayEventMessage:
 class AudioChunkMessage:
     """Audio chunk message (incoming)."""
     sessionId: str
-    type: str = field(default=MessageType.AUDIO_CHUNK, init=False)
+    type: str = field(default_factory=lambda: MessageType.AUDIO_CHUNK.value, init=False)
     timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
     # Audio data is sent as binary, not in JSON
     
@@ -167,7 +167,7 @@ class TranscriptionMessage:
     sessionId: str
     text: str
     isFinal: bool
-    type: str = field(default=MessageType.TRANSCRIPTION, init=False)
+    type: str = field(default_factory=lambda: MessageType.TRANSCRIPTION.value, init=False)
     timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
     language: str = "en-US"
     confidence: Optional[float] = None
@@ -185,7 +185,7 @@ class TranslationMessage:
     translatedText: str
     sourceLanguage: str
     targetLanguage: str
-    type: str = field(default=MessageType.TRANSLATION, init=False)
+    type: str = field(default_factory=lambda: MessageType.TRANSLATION.value, init=False)
     timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
     
     def to_dict(self) -> Dict[str, Any]:
@@ -199,7 +199,7 @@ class BatteryUpdateMessage:
     sessionId: str
     level: int  # 0-100
     isCharging: bool
-    type: str = field(default=MessageType.GLASSES_BATTERY_UPDATE, init=False)
+    type: str = field(default_factory=lambda: MessageType.GLASSES_BATTERY_UPDATE.value, init=False)
     timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
     
     def to_dict(self) -> Dict[str, Any]:
@@ -211,7 +211,7 @@ class BatteryUpdateMessage:
 class ErrorMessage:
     """Error message."""
     error: str
-    type: str = field(default=MessageType.ERROR, init=False)
+    type: str = field(default_factory=lambda: MessageType.ERROR.value, init=False)
     timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
     sessionId: Optional[str] = None
     code: Optional[str] = None

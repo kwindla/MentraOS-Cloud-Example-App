@@ -172,7 +172,7 @@ class AppSession:
                 return
             
             # Handle connection acknowledgment
-            if data.get("type") == MessageType.TPA_CONNECTION_ACK:
+            if data.get("type") == MessageType.TPA_CONNECTION_ACK.value:
                 await self._handle_connection_ack(data)
                 return
             
