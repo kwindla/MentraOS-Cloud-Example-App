@@ -9,6 +9,7 @@ import argparse
 from loguru import logger
 from dotenv import load_dotenv
 
+from pipecat.processors.filters.stt_mute_filter import STTMuteConfig, STTMuteFilter, STTMuteStrategy
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import (
     Frame,
@@ -117,6 +118,16 @@ async def run_bot(
             vad_analyzer=SileroVADAnalyzer(),
         )
 
+        # Set up LLM with initial system message
+        messages = [
+            {
+                "role": "system",
+                "content": "You are a helpful AI assistant on smart glasses. "
+                "Keep your responses brief and conversational. "
+                "Maximum 2-3 sentences per response.",
+            }
+        ]
+
         # Create STT service
         stt = DeepgramSTTService(
             api_key=deepgram_api_key,
@@ -130,15 +141,7 @@ async def run_bot(
             encoding="linear16",
         )
 
-        # Set up LLM with initial system message
-        messages = [
-            {
-                "role": "system",
-                "content": "You are a helpful AI assistant on smart glasses. "
-                "Keep your responses brief and conversational. "
-                "Maximum 2-3 sentences per response.",
-            }
-        ]
+        stt_mute_filter = STTMuteFilter(config=STTMuteConfig(strategies={STTMuteStrategy.ALWAYS}))
 
         llm = OpenAILLMService(api_key=openai_api_key)
         tts = CartesiaTTSService(
@@ -159,6 +162,7 @@ async def run_bot(
         pipeline = Pipeline(
             [
                 transport.input(),
+                stt_mute_filter,
                 stt,
                 user_transcription_handler,
                 context_aggregator.user(),
