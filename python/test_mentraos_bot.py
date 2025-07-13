@@ -21,11 +21,11 @@ from pipecat.pipeline.task import PipelineTask, PipelineParams
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.openai import OpenAILLMService
+from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.processors.aggregators.openai_llm_context import (
     OpenAILLMContext,
     OpenAILLMContextFrame,
 )
-from pipecat.processors.aggregators.llm_response import LLMAssistantAggregatorParams
 
 
 # Add parent directory to path to import mentraos module
@@ -39,7 +39,8 @@ load_dotenv()
 
 # Configure logger
 logger.remove()
-logger.add(sys.stderr, level="TRACE")
+# logger.add(sys.stderr, level="TRACE")
+logger.add(sys.stderr, level="DEBUG")
 
 
 class UserTranscriptionHandler(FrameProcessor):
@@ -77,9 +78,9 @@ class AssistantResponseHandler(FrameProcessor):
                 TextWallFrame(f"Assistant said: {last_message['content']}"), direction
             )
 
-            # Speak the assistant's response
-            if last_message.get("role") == "assistant" and last_message.get("content"):
-                await self._app_session.audio.speak(last_message["content"])
+            # Don't speak - the MentraOSOutputTransport will handle TTS audio
+            # if last_message.get("role") == "assistant" and last_message.get("content"):
+            #     await self._app_session.audio.speak(last_message["content"])
 
         await self.push_frame(frame, direction)
 
@@ -95,12 +96,16 @@ async def run_bot(
         # Get API keys
         deepgram_api_key = os.getenv("DEEPGRAM_API_KEY")
         openai_api_key = os.getenv("OPENAI_API_KEY")
+        cartesia_api_key = os.getenv("CARTESIA_API_KEY")
 
         if not deepgram_api_key:
             logger.error("❌ DEEPGRAM_API_KEY not set in environment")
             return
         if not openai_api_key:
             logger.error("❌ OPENAI_API_KEY not set in environment")
+            return
+        if not cartesia_api_key:
+            logger.error("❌ CARTESIA_API_KEY not set in environment")
             return
 
         # Create MentraOS transport
@@ -136,13 +141,18 @@ async def run_bot(
         ]
 
         llm = OpenAILLMService(api_key=openai_api_key)
+        tts = CartesiaTTSService(
+            api_key=cartesia_api_key,
+            voice_id="71a7ad14-091c-4e8e-a314-022ece01c121",  # British Reading Lady
+        )
         user_transcription_handler = UserTranscriptionHandler()
         # Create a placeholder for the handler - will set app_session after transport is ready
         assistant_response_handler = AssistantResponseHandler(None)
         context = OpenAILLMContext(messages)
         context_aggregator = llm.create_context_aggregator(
             context,
-            assistant_params=LLMAssistantAggregatorParams(expect_stripped_words=False),
+            # need to set expect_stripped_words if the assistant aggregator is before the transport output.
+            # assistant_params=LLMAssistantAggregatorParams(expect_stripped_words=False),
         )
 
         # Build pipeline
@@ -153,9 +163,10 @@ async def run_bot(
                 user_transcription_handler,
                 context_aggregator.user(),
                 llm,
+                tts,
+                transport.output(),
                 context_aggregator.assistant(),
                 assistant_response_handler,
-                transport.output(),
             ]
         )
 
@@ -175,16 +186,18 @@ async def run_bot(
             logger.info("🎉 Client connected to MentraOS")
             # Set the app_session on the assistant response handler
             assistant_response_handler._app_session = app_session
-            
+
             # Register audio play response handler
             @app_session.events.on_audio_play_response
             async def handle_audio_response(event):
-                logger.info(f"🔊 AUDIO RESPONSE EVENT: requestId={event.request_id}, success={event.success}")
+                logger.info(
+                    f"🔊 AUDIO RESPONSE EVENT: requestId={event.request_id}, success={event.success}"
+                )
                 if not event.success and event.error:
                     logger.error(f"  Error: {event.error}")
-            
-            # Initialize the conversation context
-            await task.queue_frames([context_aggregator.user().get_context_frame()])
+
+            # Don't send initial context frame - wait for user to speak first
+            # await task.queue_frames([context_aggregator.user().get_context_frame()])
 
         logger.info(f"🎯 Pipeline running for session {session_id}")
         runner = PipelineRunner(handle_sigint=True)

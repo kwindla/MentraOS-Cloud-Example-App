@@ -1,6 +1,7 @@
 """MentraOS WebSocket Transport for Pipecat."""
 
 import asyncio
+import os
 from typing import Optional, Callable
 from concurrent.futures import ThreadPoolExecutor
 
@@ -16,6 +17,10 @@ from pipecat.frames.frames import (
     CancelFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
+    TTSAudioRawFrame,
+    TTSStartedFrame,
+    TTSStoppedFrame,
+    OutputAudioRawFrame,
 )
 from dataclasses import dataclass
 from pipecat.processors.frame_processor import FrameDirection
@@ -28,6 +33,7 @@ from loguru import logger
 from ..core.app_session import AppSession
 from ..events.event_types import EventType, AudioChunkEvent, TranscriptionEvent
 from ..protocol.subscriptions import Subscription
+from .mp3_encoder import MP3StreamEncoder
 
 
 @dataclass
@@ -98,11 +104,61 @@ class MentraOSOutputTransport(BaseOutputTransport):
     def __init__(self, transport: "MentraOSWebSocketTransport", params: TransportParams):
         super().__init__(params)
         self._transport = transport
+        # Use absolute path for audio generation directory
+        audio_dir = os.path.join(os.path.dirname(__file__), "..", "..", "audio-generation")
+        self._mp3_encoder = MP3StreamEncoder(output_dir=audio_dir)
+        self._current_tts_filename: Optional[str] = None
+        self._public_url = os.getenv("MENTRAOS_PUBLIC_URL", "https://khk-mentra.ngrok.app")
+        self._tts_active = False  # Track if we're between TTSStartedFrame and TTSStoppedFrame
+        
+        logger.info(f"🎵 MentraOSOutputTransport initialized with MP3 streaming (URL: {self._public_url})")
+
+    async def start(self, frame: StartFrame):
+        """Start the output transport."""
+        logger.info("📌 MentraOSOutputTransport.start() called")
+        await super().start(frame)
+        
+        # Initialize MediaSenders for audio routing
+        # This creates the default MediaSender (destination=None) and any configured destinations
+        await self.set_transport_ready(frame)
+        
+        logger.info(f"🚀 MentraOSOutputTransport started, media_senders: {list(self._media_senders.keys())}")
+        logger.info(f"🔍 Transport type: {type(self)}, has write_audio_frame: {hasattr(self, 'write_audio_frame')}")
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         """Process frames to be sent to MentraOS."""
+        # Log all frames for debugging
+        if not isinstance(frame, (InputAudioRawFrame, OutputAudioRawFrame)) or isinstance(frame, TTSAudioRawFrame):
+            logger.debug(f"📊 MentraOSOutputTransport.process_frame: {type(frame).__name__}")
+        
+        # Handle TTS state tracking
+        if isinstance(frame, TTSStartedFrame):
+            logger.info("🎤 Received TTSStartedFrame - TTS is now active")
+            self._tts_active = True
+        elif isinstance(frame, TTSStoppedFrame):
+            logger.info("🔇 Received TTSStoppedFrame - finalizing MP3 stream")
+            self._tts_active = False
+            # Finalize the current MP3 stream
+            if self._current_tts_filename:
+                if self._mp3_encoder.finalize_stream():
+                    logger.info(f"✅ Finalized TTS audio file: {self._current_tts_filename}")
+                else:
+                    logger.error(f"❌ Failed to finalize TTS audio file: {self._current_tts_filename}")
+                self._current_tts_filename = None
+            else:
+                logger.debug("📝 TTSStoppedFrame received with no active stream (no audio was generated)")
+        
+        if isinstance(frame, TTSAudioRawFrame):
+            logger.info(f"🎵 MentraOSOutputTransport received TTSAudioRawFrame: {len(frame.audio)} bytes, tts_active={self._tts_active}")
+            # Debug: Check transport_destination
+            logger.debug(f"🔍 TTSAudioRawFrame transport_destination: {getattr(frame, 'transport_destination', 'NOT SET')}")
+            logger.debug(f"🔍 Available media_senders: {list(self._media_senders.keys())}")
+        
+        # Call parent's process_frame to handle audio routing through MediaSenders
+        if isinstance(frame, OutputAudioRawFrame):
+            logger.info(f"🔄 Calling super().process_frame for audio frame: {type(frame).__name__}")
         await super().process_frame(frame, direction)
-
+        
         # Only send TextWallFrame to MentraOS
         if isinstance(frame, TextWallFrame):
             await self._transport._write_frame(frame)
@@ -112,10 +168,96 @@ class MentraOSOutputTransport(BaseOutputTransport):
         # Push frame downstream
         await self.push_frame(frame, direction)
 
-    async def _handle_frame(self, frame: Frame):
-        """Override to prevent base class warning about unregistered destinations."""
-        # We handle frames in process_frame, so just pass here
-        pass
+    
+    async def stop(self, frame: EndFrame):
+        """Stop the output transport and finalize any active streams."""
+        # Reset TTS state
+        self._tts_active = False
+        
+        # Finalize any active MP3 stream
+        if self._current_tts_filename:
+            if self._mp3_encoder.finalize_stream():
+                logger.info(f"✅ Finalized TTS audio file on stop: {self._current_tts_filename}")
+            else:
+                logger.error(f"❌ Failed to finalize TTS audio file on stop: {self._current_tts_filename}")
+            self._current_tts_filename = None
+        
+        await super().stop(frame)
+    
+    async def write_audio_frame(self, frame: OutputAudioRawFrame):
+        """Override to intercept audio frames and write to MP3."""
+        logger.info(f"🎯🎯🎯 MentraOSOutputTransport.write_audio_frame called with {type(frame).__name__}: {len(frame.audio)} bytes, {frame.sample_rate}Hz, {frame.num_channels}ch")
+        
+        if isinstance(frame, TTSAudioRawFrame):
+            # Only process TTS audio if we're between TTSStartedFrame and TTSStoppedFrame
+            if not self._tts_active:
+                logger.warning(f"⚠️ Ignoring TTSAudioRawFrame - not between TTSStartedFrame and TTSStoppedFrame")
+                return
+            
+            logger.info(f"🔊 Processing TTSAudioRawFrame, current_filename: {self._current_tts_filename}")
+            try:
+                # Start new stream if needed
+                if not self._current_tts_filename:
+                    self._current_tts_filename = self._mp3_encoder.start_new_stream(
+                        frame.sample_rate,
+                        frame.num_channels
+                    )
+                    
+                    if not self._current_tts_filename:
+                        logger.error("Failed to start MP3 stream")
+                        return
+                    
+                    # Write first chunk
+                    if self._mp3_encoder.write_audio_chunk(frame.audio):
+                        logger.info(f"📝 Wrote first audio chunk to {self._current_tts_filename}")
+                        
+                        # Send play_audio request to MentraOS
+                        audio_url = f"{self._public_url}/audio-stream/{self._current_tts_filename}"
+                        logger.info(f"🔊 Sending play_audio request: {audio_url}")
+                        
+                        try:
+                            result = await self._transport._app_session.audio.play_audio(
+                                audio_url=audio_url,
+                                volume=1.0,
+                                stop_other_audio=True
+                            )
+                            logger.info(f"📢 Play audio result: {result}")
+                        except Exception as e:
+                            logger.error(f"❌ Failed to send play_audio request: {e}")
+                else:
+                    # Write subsequent chunks
+                    if self._mp3_encoder.write_audio_chunk(frame.audio):
+                        logger.debug(f"📝 Wrote audio chunk to {self._current_tts_filename}")
+                    else:
+                        logger.error(f"❌ Failed to write audio chunk")
+                        
+            except Exception as e:
+                logger.error(f"❌ Error handling TTS audio: {e}")
+        
+        else:
+            logger.info(f"📤 Non-TTS audio frame, passing to transport: {type(frame).__name__}")
+        
+        # Don't send TTS audio to the actual transport
+        # For other audio types, call the parent method
+        if not isinstance(frame, TTSAudioRawFrame):
+            await self._transport.write_audio_frame(frame)
+    
+    async def cancel(self, frame: CancelFrame):
+        """Handle cancellation/interruption."""
+        logger.info("🛑 Handling interruption - finalizing audio stream")
+        
+        # Reset TTS state
+        self._tts_active = False
+        
+        # Finalize any active stream on interruption
+        if self._current_tts_filename:
+            if self._mp3_encoder.finalize_stream():
+                logger.info(f"✅ Finalized interrupted TTS audio: {self._current_tts_filename}")
+            else:
+                logger.error(f"❌ Failed to finalize interrupted TTS audio: {self._current_tts_filename}")
+            self._current_tts_filename = None
+        
+        await super().cancel(frame)
 
 
 class MentraOSWebSocketTransport(BaseTransport):
@@ -148,7 +290,10 @@ class MentraOSWebSocketTransport(BaseTransport):
         self._app_session: Optional[AppSession] = None
 
         # Create transport params
-        params = TransportParams(vad_analyzer=vad_analyzer)
+        params = TransportParams(
+            vad_analyzer=vad_analyzer,
+            audio_out_enabled=True  # Enable audio output
+        )
 
         # Create input/output transports
         self._input_transport = MentraOSInputTransport(self, params)
@@ -341,3 +486,12 @@ class MentraOSWebSocketTransport(BaseTransport):
         """Push an error frame to the pipeline."""
         error_frame = ErrorFrame(error=error)
         await self._input_transport.push_frame(error_frame)
+    
+    async def write_audio_frame(self, frame: OutputAudioRawFrame):
+        """Write audio frame - this is called by the MediaSender in BaseOutputTransport.
+        
+        We delegate to our output transport which will handle MP3 encoding for TTS frames.
+        """
+        logger.info(f"🎯 MentraOSWebSocketTransport.write_audio_frame called: {type(frame).__name__}")
+        # Our MentraOSOutputTransport has the write_audio_frame method that handles TTS
+        await self._output_transport.write_audio_frame(frame)

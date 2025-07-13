@@ -417,7 +417,7 @@ async def generate_sine_mp3(duration: float = 5.0):
 
 @app.get("/audio-stream/{filename}")
 async def stream_audio_file(filename: str):
-    """Stream audio file as MP3, with support for files being generated in real-time.
+    """Stream MP3 audio file directly, with support for files being generated in real-time.
     
     Args:
         filename: Stem of the file in audio-generation directory
@@ -425,12 +425,6 @@ async def stream_audio_file(filename: str):
     Returns:
         StreamingResponse with MP3 audio data
     """
-    if lameenc is None:
-        raise HTTPException(
-            status_code=500, 
-            detail="lameenc not installed. Run: pip install lameenc"
-        )
-    
     # Sanitize filename to prevent path traversal
     safe_filename = Path(filename).name
     audio_dir = Path("audio-generation")
@@ -439,56 +433,32 @@ async def stream_audio_file(filename: str):
     completed_file = audio_dir / safe_filename
     generating_file = audio_dir / f"{safe_filename}.generating"
     
-    # Audio parameters for 16kHz 16-bit mono WAV
-    sample_rate = 16000
-    channels = 1
-    bytes_per_sample = 2  # 16-bit
-    
-    # MP3 encoder setup for 64kbps
-    encoder = lameenc.Encoder()
-    encoder.set_bit_rate(64)  # 64 kbps as requested
-    encoder.set_in_sample_rate(sample_rate)
-    encoder.set_channels(channels)
-    encoder.set_quality(2)  # High quality
-    
     async def stream_mp3():
-        """Generator that produces MP3 data from WAV file."""
+        """Generator that streams MP3 data directly."""
         bytes_read = 0
         
         try:
             # Case 1: Completed file exists
             if completed_file.exists() and completed_file.is_file():
-                logger.info(f"Streaming completed file: {completed_file}")
+                logger.info(f"Streaming completed MP3 file: {completed_file}")
                 
                 async with aiofiles.open(completed_file, 'rb') as f:
-                    # Read and encode in chunks
-                    chunk_size = sample_rate * bytes_per_sample  # 1 second chunks
+                    # Stream in chunks
+                    chunk_size = 8192  # 8KB chunks
                     
                     while True:
-                        wav_data = await f.read(chunk_size)
-                        if not wav_data:
+                        mp3_data = await f.read(chunk_size)
+                        if not mp3_data:
                             break
                         
-                        # Ensure we have an even number of bytes for 16-bit samples
-                        if len(wav_data) % 2 != 0:
-                            wav_data = wav_data[:-1]
-                        
-                        # Encode to MP3
-                        mp3_data = encoder.encode(wav_data)
-                        if mp3_data:
-                            yield bytes(mp3_data)
-                    
-                    # Flush encoder
-                    mp3_data = encoder.flush()
-                    if mp3_data:
-                        yield bytes(mp3_data)
+                        yield mp3_data
                         
                 logger.info(f"✅ Completed streaming {completed_file}")
                 return
             
             # Case 2: Generating file exists
             elif generating_file.exists() and generating_file.is_file():
-                logger.info(f"Streaming generating file: {generating_file}")
+                logger.info(f"Streaming generating MP3 file: {generating_file}")
                 
                 # Stream the file as it's being generated
                 file_handle = await aiofiles.open(generating_file, 'rb')
@@ -497,21 +467,12 @@ async def stream_audio_file(filename: str):
                     while True:
                         # Read any new data
                         await file_handle.seek(bytes_read)
-                        wav_data = await file_handle.read(8192)  # Read up to 8KB at a time
+                        mp3_data = await file_handle.read(8192)  # Read up to 8KB at a time
                         
-                        if wav_data:
-                            bytes_read += len(wav_data)
-                            
-                            # Ensure we have an even number of bytes for 16-bit samples
-                            if len(wav_data) % 2 != 0:
-                                wav_data = wav_data[:-1]
-                                bytes_read -= 1
-                            
-                            # Encode to MP3
-                            mp3_data = encoder.encode(wav_data)
-                            if mp3_data:
-                                yield bytes(mp3_data)
-                                logger.debug(f"Sent {len(mp3_data)} MP3 bytes (read {bytes_read} WAV bytes total)")
+                        if mp3_data:
+                            bytes_read += len(mp3_data)
+                            yield mp3_data
+                            logger.debug(f"Sent {len(mp3_data)} MP3 bytes ({bytes_read} total)")
                         
                         # Check if generating file still exists
                         if not generating_file.exists():
@@ -535,21 +496,9 @@ async def stream_audio_file(filename: str):
                             remaining_data = await f.read()
                             
                             if remaining_data:
-                                # Ensure even number of bytes
-                                if len(remaining_data) % 2 != 0:
-                                    remaining_data = remaining_data[:-1]
-                                
-                                # Encode final data
-                                mp3_data = encoder.encode(remaining_data)
-                                if mp3_data:
-                                    yield bytes(mp3_data)
-                
-                # Flush encoder
-                mp3_data = encoder.flush()
-                if mp3_data:
-                    yield bytes(mp3_data)
+                                yield remaining_data
                     
-                logger.info(f"✅ Completed streaming {safe_filename} ({bytes_read} WAV bytes total)")
+                logger.info(f"✅ Completed streaming {safe_filename} ({bytes_read} bytes total)")
             
             else:
                 # Neither file exists
@@ -567,8 +516,7 @@ async def stream_audio_file(filename: str):
         media_type="audio/mpeg",
         headers={
             "Cache-Control": "no-cache",
-            "X-Audio-Source": str(safe_filename),
-            "X-Audio-Format": "16kHz 16-bit mono WAV to 64kbps MP3"
+            "X-Audio-Source": str(safe_filename)
         }
     )
 
