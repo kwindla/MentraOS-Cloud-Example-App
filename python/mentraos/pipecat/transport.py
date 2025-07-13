@@ -1,6 +1,8 @@
 """MentraOS WebSocket Transport for Pipecat."""
 
 import asyncio
+import os
+import time
 from typing import Optional, Callable
 from concurrent.futures import ThreadPoolExecutor
 
@@ -16,6 +18,13 @@ from pipecat.frames.frames import (
     CancelFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
+    TTSAudioRawFrame,
+    TTSStartedFrame,
+    TTSStoppedFrame,
+    OutputAudioRawFrame,
+    BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
+    TTSTextFrame,
 )
 from dataclasses import dataclass
 from pipecat.processors.frame_processor import FrameDirection
@@ -28,6 +37,7 @@ from loguru import logger
 from ..core.app_session import AppSession
 from ..events.event_types import EventType, AudioChunkEvent, TranscriptionEvent
 from ..protocol.subscriptions import Subscription
+from .mp3_encoder import MP3StreamEncoder
 
 
 @dataclass
@@ -69,11 +79,9 @@ class MentraOSInputTransport(BaseInputTransport):
             if vad_state == VADState.SPEAKING and self._vad_state != VADState.SPEAKING:
                 # User started speaking
                 await self.push_frame(UserStartedSpeakingFrame())
-                logger.debug("🎤 User started speaking")
             elif vad_state != VADState.SPEAKING and self._vad_state == VADState.SPEAKING:
                 # User stopped speaking
                 await self.push_frame(UserStoppedSpeakingFrame())
-                logger.debug("🔇 User stopped speaking")
 
             self._vad_state = vad_state
 
@@ -95,27 +103,274 @@ class MentraOSInputTransport(BaseInputTransport):
 class MentraOSOutputTransport(BaseOutputTransport):
     """Output transport for sending frames to MentraOS."""
 
-    def __init__(self, transport: "MentraOSWebSocketTransport", params: TransportParams):
+    def __init__(self, transport: "MentraOSWebSocketTransport", params: TransportParams, bot_stopped_speaking_delay: float = 2.5):
         super().__init__(params)
         self._transport = transport
+        # Use absolute path for audio generation directory
+        audio_dir = os.path.join(os.path.dirname(__file__), "..", "..", "audio-generation")
+        self._mp3_encoder = MP3StreamEncoder(output_dir=audio_dir)
+        self._current_tts_filename: Optional[str] = None
+        self._public_url = os.getenv("MENTRAOS_PUBLIC_URL", "https://khk-mentra.ngrok.app")
+        self._tts_active = False  # Track if we're between TTSStartedFrame and TTSStoppedFrame
+        
+        # Audio duration tracking for silent frame generation
+        self._audio_start_time: Optional[float] = None
+        self._total_audio_samples: int = 0
+        self._audio_sample_rate: int = 24000  # Default, will be updated from frames
+        self._silent_frames_task: Optional[asyncio.Task] = None
+        self._bot_stopped_speaking_delay = bot_stopped_speaking_delay  # MentraOS audio startup delay
+        
+        logger.info(f"🎵 MentraOSOutputTransport initialized with MP3 streaming (URL: {self._public_url})")
+
+    async def start(self, frame: StartFrame):
+        """Start the output transport."""
+        logger.info("📌 MentraOSOutputTransport.start() called")
+        await super().start(frame)
+        
+        # Initialize MediaSenders for audio routing
+        # This creates the default MediaSender (destination=None) and any configured destinations
+        await self.set_transport_ready(frame)
+        
+        logger.info(f"🚀 MentraOSOutputTransport started, media_senders: {list(self._media_senders.keys())}")
+        # Transport initialized with write_audio_frame support
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         """Process frames to be sent to MentraOS."""
+        # Handle TTSTextFrame specially to prevent duplication
+        # TTSTextFrame is already pushed by the TTS service, so we just need to
+        # forward it downstream without going through the parent's audio queue
+        if isinstance(frame, TTSTextFrame):
+            await self.push_frame(frame, direction)
+            return
+        
+        # Log all frames for debugging
+        # if not isinstance(frame, (InputAudioRawFrame, OutputAudioRawFrame)) or isinstance(frame, TTSAudioRawFrame):
+        #     logger.debug(f"📊 MentraOSOutputTransport.process_frame: {type(frame).__name__}")
+        
+        # Also log bot speaking frames
+        # if isinstance(frame, (BotStartedSpeakingFrame, BotStoppedSpeakingFrame)):
+        #     logger.info(f"🤖 MentraOSOutputTransport.process_frame: {type(frame).__name__} (direction: {direction})")
+        
+        # Handle TTS state tracking
+        if isinstance(frame, TTSStartedFrame):
+            logger.info("🎤 Received TTSStartedFrame - TTS is now active")
+            self._tts_active = True
+        elif isinstance(frame, TTSStoppedFrame):
+            logger.info("🔇 Received TTSStoppedFrame - finalizing MP3 stream")
+            self._tts_active = False
+            
+            # Calculate remaining playback time and start silent frames if needed
+            if self._audio_start_time and self._total_audio_samples > 0:
+                audio_duration = self._total_audio_samples / self._audio_sample_rate
+                elapsed_time = time.time() - self._audio_start_time
+                remaining_time = audio_duration - elapsed_time + 0.5  # Add 500ms buffer for network/playback delays
+                
+                # Add MentraOS audio startup delay
+                total_silent_duration = remaining_time + self._bot_stopped_speaking_delay
+                
+                logger.info(f"⏱️ Audio stats: Total duration={audio_duration:.3f}s, Elapsed={elapsed_time:.3f}s, Remaining={remaining_time:.3f}s")
+                logger.info(f"🎯 Adding {self._bot_stopped_speaking_delay}s MentraOS startup delay = {total_silent_duration:.3f}s total silent frames")
+                
+                if total_silent_duration > 0:
+                    # Cancel any existing silent frames task
+                    if self._silent_frames_task and not self._silent_frames_task.done():
+                        self._silent_frames_task.cancel()
+                        pass  # Silent frames task cancelled
+                    
+                    # Start new silent frames task with the extended duration
+                    self._silent_frames_task = asyncio.create_task(self._send_silent_frames(total_silent_duration))
+                    # Started silent frames task
+                else:
+                    pass  # Audio generation was slower than playback - no silent frames needed
+            
+            # Finalize the current MP3 stream
+            if self._current_tts_filename:
+                if self._mp3_encoder.finalize_stream():
+                    logger.info(f"✅ Finalized TTS audio file: {self._current_tts_filename}")
+                else:
+                    logger.error(f"❌ Failed to finalize TTS audio file: {self._current_tts_filename}")
+                self._current_tts_filename = None
+            else:
+                pass  # TTSStoppedFrame received with no active stream
+        
+        # if isinstance(frame, TTSAudioRawFrame):
+        #     logger.info(f"🎵 MentraOSOutputTransport received TTSAudioRawFrame: {len(frame.audio)} bytes, tts_active={self._tts_active}")
+        #     # Debug: Check transport_destination
+        #     logger.debug(f"🔍 TTSAudioRawFrame transport_destination: {getattr(frame, 'transport_destination', 'NOT SET')}")
+        #     logger.debug(f"🔍 Available media_senders: {list(self._media_senders.keys())}")
+        
+        # Call parent's process_frame to handle audio routing through MediaSenders
         await super().process_frame(frame, direction)
-
+        
         # Only send TextWallFrame to MentraOS
         if isinstance(frame, TextWallFrame):
             await self._transport._write_frame(frame)
         elif isinstance(frame, (EndFrame, CancelFrame)):
             await self._transport._write_frame(frame)
+        
+        # Note: We do NOT push frames downstream here because:
+        # 1. SystemFrames are already pushed by the parent's process_frame
+        # 2. Non-system frames that go through _handle_frame -> handle_sync_frame
+        #    are pushed downstream by the MediaSender's _audio_task_handler
+        # 3. Pushing here would cause duplicate frame delivery
 
-        # Push frame downstream
-        await self.push_frame(frame, direction)
-
-    async def _handle_frame(self, frame: Frame):
-        """Override to prevent base class warning about unregistered destinations."""
-        # We handle frames in process_frame, so just pass here
-        pass
+    
+    async def stop(self, frame: EndFrame):
+        """Stop the output transport and finalize any active streams."""
+        # Reset TTS state
+        self._tts_active = False
+        
+        # Cancel silent frames task if running
+        if self._silent_frames_task and not self._silent_frames_task.done():
+            self._silent_frames_task.cancel()
+            pass  # Silent frames task cancelled on stop
+        
+        # Finalize any active MP3 stream
+        if self._current_tts_filename:
+            if self._mp3_encoder.finalize_stream():
+                logger.info(f"✅ Finalized TTS audio file on stop: {self._current_tts_filename}")
+            else:
+                logger.error(f"❌ Failed to finalize TTS audio file on stop: {self._current_tts_filename}")
+            self._current_tts_filename = None
+        
+        await super().stop(frame)
+    
+    async def write_audio_frame(self, frame: OutputAudioRawFrame):
+        """Override to intercept audio frames and write to MP3."""
+        
+        if isinstance(frame, TTSAudioRawFrame):
+            # Only process TTS audio if we're between TTSStartedFrame and TTSStoppedFrame
+            if not self._tts_active:
+                return
+            
+            # Processing TTSAudioRawFrame
+            try:
+                # Track audio duration - start timing and reset samples when new stream starts
+                if not self._current_tts_filename:
+                    self._audio_start_time = time.time()
+                    self._total_audio_samples = 0
+                    self._audio_sample_rate = frame.sample_rate
+                    logger.info(f"⏱️ Starting audio duration tracking at {self._audio_start_time:.3f}, sample_rate={self._audio_sample_rate}")
+                
+                # Count samples in this frame (assuming 16-bit audio = 2 bytes per sample)
+                num_samples = len(frame.audio) // 2
+                self._total_audio_samples += num_samples
+                
+                # Start new stream if needed
+                if not self._current_tts_filename:
+                    self._current_tts_filename = self._mp3_encoder.start_new_stream(
+                        frame.sample_rate,
+                        frame.num_channels
+                    )
+                    
+                    if not self._current_tts_filename:
+                        logger.error("Failed to start MP3 stream")
+                        return
+                    
+                    # Write first chunk
+                    if self._mp3_encoder.write_audio_chunk(frame.audio):
+                        
+                        # Send play_audio request to MentraOS
+                        audio_url = f"{self._public_url}/audio-stream/{self._current_tts_filename}"
+                        logger.info(f"🔊 Sending play_audio request: {audio_url}")
+                        
+                        try:
+                            result = await self._transport._app_session.audio.play_audio(
+                                audio_url=audio_url,
+                                volume=1.0,
+                                stop_other_audio=True
+                            )
+                            logger.info(f"📢 Play audio result: {result}")
+                        except Exception as e:
+                            logger.error(f"❌ Failed to send play_audio request: {e}")
+                else:
+                    # Write subsequent chunks
+                    if not self._mp3_encoder.write_audio_chunk(frame.audio):
+                        logger.error(f"❌ Failed to write audio chunk")
+                        
+            except Exception as e:
+                logger.error(f"❌ Error handling TTS audio: {e}")
+        
+        # else:
+        #     logger.info(f"📤 Non-TTS audio frame: {type(frame).__name__}")
+        
+        # Note: We do NOT forward frames from write_audio_frame - this is the final
+        # destination. The MediaSender tracks bot speaking state when it processes
+        # TTSAudioRawFrame frames through the audio task.
+    
+    async def _send_silent_frames(self, duration: float):
+        """Send silent audio frames to keep MediaSender active during audio playback."""
+        # Starting to send silent frames to maintain bot speaking state
+        
+        # Send frames every 20ms (typical audio frame duration)
+        frame_duration = 0.02  # 20ms
+        num_frames = int(duration / frame_duration)
+        
+        # Create silent audio (480 samples at 24kHz = 20ms)
+        samples_per_frame = int(self._audio_sample_rate * frame_duration)
+        silent_audio = b'\x00' * (samples_per_frame * 2)  # 16-bit samples = 2 bytes per sample
+        
+        # Silent frame config: {num_frames} frames, {samples_per_frame} samples/frame
+        
+        start_time = time.time()
+        frames_sent = 0
+        
+        try:
+            for i in range(num_frames):
+                # Create silent OutputAudioRawFrame (not TTSAudioRawFrame!)
+                silent_frame = OutputAudioRawFrame(
+                    audio=silent_audio,
+                    sample_rate=self._audio_sample_rate,
+                    num_channels=1
+                )
+                
+                # Route through parent's process_frame to reach MediaSender
+                # This will keep the MediaSender's audio task active
+                await super().process_frame(silent_frame, FrameDirection.DOWNSTREAM)
+                
+                frames_sent += 1
+                
+                # Progress tracking
+                # if frames_sent % 50 == 0:  # 50 frames = 1 second at 20ms/frame
+                #     elapsed = time.time() - start_time
+                
+                # Wait for next frame timing
+                await asyncio.sleep(frame_duration)
+            
+            total_time = time.time() - start_time
+            # Finished sending silent frames
+            
+        except asyncio.CancelledError:
+            # Silent frames task cancelled
+            raise
+        except Exception as e:
+            logger.error(f"❌ Error in silent frames task: {e}")
+        finally:
+            # Reset audio tracking
+            self._audio_start_time = None
+            self._total_audio_samples = 0
+    
+    async def cancel(self, frame: CancelFrame):
+        """Handle cancellation/interruption."""
+        logger.info("🛑 Handling interruption - finalizing audio stream")
+        
+        # Reset TTS state
+        self._tts_active = False
+        
+        # Cancel silent frames task if running
+        if self._silent_frames_task and not self._silent_frames_task.done():
+            self._silent_frames_task.cancel()
+            pass  # Silent frames task cancelled on interruption
+        
+        # Finalize any active stream on interruption
+        if self._current_tts_filename:
+            if self._mp3_encoder.finalize_stream():
+                logger.info(f"✅ Finalized interrupted TTS audio: {self._current_tts_filename}")
+            else:
+                logger.error(f"❌ Failed to finalize interrupted TTS audio: {self._current_tts_filename}")
+            self._current_tts_filename = None
+        
+        await super().cancel(frame)
 
 
 class MentraOSWebSocketTransport(BaseTransport):
@@ -137,6 +392,7 @@ class MentraOSWebSocketTransport(BaseTransport):
         vad_analyzer: Optional[VADAnalyzer] = None,
         input_name: str | None = None,
         output_name: str | None = None,
+        bot_stopped_speaking_delay: float = 2.5,
     ):
         super().__init__(input_name=input_name, output_name=output_name)
 
@@ -146,13 +402,17 @@ class MentraOSWebSocketTransport(BaseTransport):
         self._package_name = package_name
         self._enable_transcription = enable_transcription
         self._app_session: Optional[AppSession] = None
+        self._bot_stopped_speaking_delay = bot_stopped_speaking_delay
 
         # Create transport params
-        params = TransportParams(vad_analyzer=vad_analyzer)
+        params = TransportParams(
+            vad_analyzer=vad_analyzer,
+            audio_out_enabled=True  # Enable audio output
+        )
 
         # Create input/output transports
         self._input_transport = MentraOSInputTransport(self, params)
-        self._output_transport = MentraOSOutputTransport(self, params)
+        self._output_transport = MentraOSOutputTransport(self, params, bot_stopped_speaking_delay=bot_stopped_speaking_delay)
 
         # Tasks
         self._receive_task: Optional[asyncio.Task] = None
@@ -341,3 +601,11 @@ class MentraOSWebSocketTransport(BaseTransport):
         """Push an error frame to the pipeline."""
         error_frame = ErrorFrame(error=error)
         await self._input_transport.push_frame(error_frame)
+    
+    async def write_audio_frame(self, frame: OutputAudioRawFrame):
+        """Write audio frame - this is called by the MediaSender in BaseOutputTransport.
+        
+        We delegate to our output transport which will handle MP3 encoding for TTS frames.
+        """
+        # Our MentraOSOutputTransport has the write_audio_frame method that handles TTS
+        await self._output_transport.write_audio_frame(frame)
