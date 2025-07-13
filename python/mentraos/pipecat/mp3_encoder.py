@@ -104,10 +104,9 @@ class MP3StreamEncoder:
             if mp3_data:
                 self.file_handle.write(bytes(mp3_data))
                 self.file_handle.flush()  # Ensure data is written immediately
-                logger.info(f"✍️ Wrote {len(mp3_data)} MP3 bytes ({len(audio_data)} PCM bytes) to {self.current_file}")
                 return True
             else:
-                logger.warning(f"⚠️ No MP3 data returned from encoder for {len(audio_data)} PCM bytes")
+                logger.debug(f"No MP3 data returned from encoder for {len(audio_data)} PCM bytes")
             
             return False
             
@@ -130,7 +129,6 @@ class MP3StreamEncoder:
             mp3_data = self.encoder.flush()
             if mp3_data:
                 self.file_handle.write(bytes(mp3_data))
-                logger.debug(f"Wrote {len(mp3_data)} final MP3 bytes")
             
             # Close file
             self.file_handle.close()
@@ -147,7 +145,7 @@ class MP3StreamEncoder:
             self.current_file = None
             self.sample_rate = None
             self.num_channels = None
-            logger.info("🔄 MP3 encoder state reset after finalization")
+            # MP3 encoder state reset after finalization
             
             return True
             
