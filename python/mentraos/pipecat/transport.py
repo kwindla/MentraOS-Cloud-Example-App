@@ -104,7 +104,7 @@ class MentraOSInputTransport(BaseInputTransport):
 class MentraOSOutputTransport(BaseOutputTransport):
     """Output transport for sending frames to MentraOS."""
 
-    def __init__(self, transport: "MentraOSWebSocketTransport", params: TransportParams):
+    def __init__(self, transport: "MentraOSWebSocketTransport", params: TransportParams, bot_stopped_speaking_delay: float = 2.5):
         super().__init__(params)
         self._transport = transport
         # Use absolute path for audio generation directory
@@ -119,7 +119,7 @@ class MentraOSOutputTransport(BaseOutputTransport):
         self._total_audio_samples: int = 0
         self._audio_sample_rate: int = 24000  # Default, will be updated from frames
         self._silent_frames_task: Optional[asyncio.Task] = None
-        self._bot_stopped_speaking_delay = 2.5  # MentraOS audio startup delay
+        self._bot_stopped_speaking_delay = bot_stopped_speaking_delay  # MentraOS audio startup delay
         
         logger.info(f"🎵 MentraOSOutputTransport initialized with MP3 streaming (URL: {self._public_url})")
 
@@ -394,6 +394,7 @@ class MentraOSWebSocketTransport(BaseTransport):
         vad_analyzer: Optional[VADAnalyzer] = None,
         input_name: str | None = None,
         output_name: str | None = None,
+        bot_stopped_speaking_delay: float = 2.5,
     ):
         super().__init__(input_name=input_name, output_name=output_name)
 
@@ -403,6 +404,7 @@ class MentraOSWebSocketTransport(BaseTransport):
         self._package_name = package_name
         self._enable_transcription = enable_transcription
         self._app_session: Optional[AppSession] = None
+        self._bot_stopped_speaking_delay = bot_stopped_speaking_delay
 
         # Create transport params
         params = TransportParams(
@@ -412,7 +414,7 @@ class MentraOSWebSocketTransport(BaseTransport):
 
         # Create input/output transports
         self._input_transport = MentraOSInputTransport(self, params)
-        self._output_transport = MentraOSOutputTransport(self, params)
+        self._output_transport = MentraOSOutputTransport(self, params, bot_stopped_speaking_delay=bot_stopped_speaking_delay)
 
         # Tasks
         self._receive_task: Optional[asyncio.Task] = None

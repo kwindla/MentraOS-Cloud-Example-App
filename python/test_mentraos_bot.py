@@ -116,6 +116,7 @@ async def run_bot(
             api_key=mentra_api_key,
             package_name=package_name,
             vad_analyzer=SileroVADAnalyzer(),
+            bot_stopped_speaking_delay=2.5,  # MentraOS requires ~2.5s to start audio playback
         )
 
         # Set up LLM with initial system message
