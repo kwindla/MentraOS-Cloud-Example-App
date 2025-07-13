@@ -24,6 +24,7 @@ from pipecat.frames.frames import (
     OutputAudioRawFrame,
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
+    TTSTextFrame,
 )
 from dataclasses import dataclass
 from pipecat.processors.frame_processor import FrameDirection
@@ -135,6 +136,13 @@ class MentraOSOutputTransport(BaseOutputTransport):
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         """Process frames to be sent to MentraOS."""
+        # Handle TTSTextFrame specially to prevent duplication
+        # TTSTextFrame is already pushed by the TTS service, so we just need to
+        # forward it downstream without going through the parent's audio queue
+        if isinstance(frame, TTSTextFrame):
+            await self.push_frame(frame, direction)
+            return
+        
         # Log all frames for debugging
         # if not isinstance(frame, (InputAudioRawFrame, OutputAudioRawFrame)) or isinstance(frame, TTSAudioRawFrame):
         #     logger.debug(f"📊 MentraOSOutputTransport.process_frame: {type(frame).__name__}")
@@ -199,9 +207,12 @@ class MentraOSOutputTransport(BaseOutputTransport):
             await self._transport._write_frame(frame)
         elif isinstance(frame, (EndFrame, CancelFrame)):
             await self._transport._write_frame(frame)
-
-        # Push frame downstream
-        await self.push_frame(frame, direction)
+        
+        # Note: We do NOT push frames downstream here because:
+        # 1. SystemFrames are already pushed by the parent's process_frame
+        # 2. Non-system frames that go through _handle_frame -> handle_sync_frame
+        #    are pushed downstream by the MediaSender's _audio_task_handler
+        # 3. Pushing here would cause duplicate frame delivery
 
     
     async def stop(self, frame: EndFrame):
