@@ -23,22 +23,39 @@ class ExampleMentraOSApp extends AppServer {
 
   protected async onSession(session: AppSession, sessionId: string, userId: string): Promise<void> {
     console.log('Session started:', sessionId);
+
+
+
     // Show welcome message
     session.layouts.showTextWall("Example App is ready (audio?)!");
 
     session.events.onAudioChunk((data) => {
-      console.log('Audio chunk');
+      // console.log('Audio chunk');
     })
 
     // Handle real-time transcription
     // requires microphone permission to be set in the developer console
-    session.events.onTranscription((data) => {
+    session.events.onTranscription(async (data) => {
       console.log('Transcription event:', data);
       if (data.isFinal) {
         session.layouts.showTextWall("You said: " + data.text, {
           view: ViewType.MAIN,
           durationMs: 3000
         });
+
+        // session.audio.speak(data.text);
+
+        if (data.text.toLowerCase().startsWith("hello")) {
+          console.log("!!! PLAYING TEST FILE !!!");
+          try {
+            const result = await session.audio.playAudio({
+              audioUrl: "https://36bb7859725a.ngrok.app/audio-stream/sine-15"
+            });
+            console.log('Audio played:', result);
+          } catch (error) {
+            console.error('Error playing audio:', error);
+          }
+        }
       }
     })
 

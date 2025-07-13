@@ -5,7 +5,7 @@ from typing import Dict, List, Callable, Any, Optional, Union
 from collections import defaultdict
 
 from ..utils.logger import get_logger
-from .event_types import Event, EventType, AudioChunkEvent, TranscriptionEvent, TranslationEvent, BatteryUpdateEvent
+from .event_types import Event, EventType, AudioChunkEvent, TranscriptionEvent, TranslationEvent, BatteryUpdateEvent, AudioPlayResponseEvent
 
 
 logger = get_logger("event_manager")
@@ -84,6 +84,8 @@ class EventManager:
                 event = TranslationEvent.from_message(message, session_id)
             elif event_type == EventType.BATTERY_UPDATE.value:
                 event = BatteryUpdateEvent.from_message(message, session_id)
+            elif event_type == EventType.AUDIO_PLAY_RESPONSE.value:
+                event = AudioPlayResponseEvent.from_message(message, session_id)
             else:
                 # Generic event for unknown types
                 event = Event.from_message(message, session_id)
@@ -174,3 +176,7 @@ class EventManager:
     def on_battery_update(self, handler: Callable[[BatteryUpdateEvent], Any]) -> Callable[[], None]:
         """Register handler for battery update events."""
         return self.on(EventType.BATTERY_UPDATE, handler)
+    
+    def on_audio_play_response(self, handler: Callable[[AudioPlayResponseEvent], Any]) -> Callable[[], None]:
+        """Register handler for audio play response events."""
+        return self.on(EventType.AUDIO_PLAY_RESPONSE, handler)

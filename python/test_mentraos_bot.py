@@ -21,7 +21,12 @@ from pipecat.pipeline.task import PipelineTask, PipelineParams
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.openai import OpenAILLMService
-from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
+from pipecat.processors.aggregators.openai_llm_context import (
+    OpenAILLMContext,
+    OpenAILLMContextFrame,
+)
+from pipecat.processors.aggregators.llm_response import LLMAssistantAggregatorParams
+
 
 # Add parent directory to path to import mentraos module
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -34,10 +39,10 @@ load_dotenv()
 
 # Configure logger
 logger.remove()
-logger.add(sys.stderr, level="DEBUG")
+logger.add(sys.stderr, level="TRACE")
 
 
-class TranscriptionLogger(FrameProcessor):
+class UserTranscriptionHandler(FrameProcessor):
     """Log transcriptions to console and sends to MentraOS display."""
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
@@ -49,6 +54,32 @@ class TranscriptionLogger(FrameProcessor):
             await self.push_frame(TextWallFrame(f"You said: {frame.text}"), direction)
         elif isinstance(frame, InterimTranscriptionFrame):
             logger.debug(f"📝 Interim: {frame.text}")
+
+        await self.push_frame(frame, direction)
+
+
+class AssistantResponseHandler(FrameProcessor):
+    """Log assistant responses to console and sends to MentraOS display."""
+
+    def __init__(self, app_session):
+        """Initialize with app session for audio access."""
+        super().__init__()
+        self._app_session = app_session
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        """Process incoming frames."""
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, OpenAILLMContextFrame):
+            last_message = frame.context.messages[-1]
+            logger.info(f"📝 Assistant: {last_message['content']}")
+            await self.push_frame(
+                TextWallFrame(f"Assistant said: {last_message['content']}"), direction
+            )
+
+            # Speak the assistant's response
+            if last_message.get("role") == "assistant" and last_message.get("content"):
+                await self._app_session.audio.speak(last_message["content"])
 
         await self.push_frame(frame, direction)
 
@@ -105,19 +136,25 @@ async def run_bot(
         ]
 
         llm = OpenAILLMService(api_key=openai_api_key)
-        transcription_logger = TranscriptionLogger()
+        user_transcription_handler = UserTranscriptionHandler()
+        # Create a placeholder for the handler - will set app_session after transport is ready
+        assistant_response_handler = AssistantResponseHandler(None)
         context = OpenAILLMContext(messages)
-        context_aggregator = llm.create_context_aggregator(context)
+        context_aggregator = llm.create_context_aggregator(
+            context,
+            assistant_params=LLMAssistantAggregatorParams(expect_stripped_words=False),
+        )
 
         # Build pipeline
         pipeline = Pipeline(
             [
                 transport.input(),
                 stt,
-                transcription_logger,
+                user_transcription_handler,
                 context_aggregator.user(),
                 llm,
                 context_aggregator.assistant(),
+                assistant_response_handler,
                 transport.output(),
             ]
         )
@@ -127,12 +164,25 @@ async def run_bot(
             params=PipelineParams(
                 enable_metrics=True,
                 enable_usage_metrics=True,
+                observers=[
+                    # LMLogObserver()
+                ],
             ),
         )
 
         @transport.event_handler("on_client_connected")
         async def on_client_connected(transport, app_session):
             logger.info("🎉 Client connected to MentraOS")
+            # Set the app_session on the assistant response handler
+            assistant_response_handler._app_session = app_session
+            
+            # Register audio play response handler
+            @app_session.events.on_audio_play_response
+            async def handle_audio_response(event):
+                logger.info(f"🔊 AUDIO RESPONSE EVENT: requestId={event.request_id}, success={event.success}")
+                if not event.success and event.error:
+                    logger.error(f"  Error: {event.error}")
+            
             # Initialize the conversation context
             await task.queue_frames([context_aggregator.user().get_context_frame()])
 

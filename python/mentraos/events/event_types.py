@@ -17,6 +17,7 @@ class EventType(str, Enum):
     APP_STOPPED = "app_stopped"
     ERROR = "error"
     CUSTOM = "custom"
+    AUDIO_PLAY_RESPONSE = "audio_play_response"
 
 
 @dataclass
@@ -139,4 +140,27 @@ class BatteryUpdateEvent(Event):
             data=base.data,
             level=message.get("level", 0),
             is_charging=message.get("isCharging", False)
+        )
+
+
+@dataclass
+class AudioPlayResponseEvent(Event):
+    """Audio play response event."""
+    request_id: str
+    success: bool
+    error: Optional[str] = None
+    
+    @classmethod
+    def from_message(cls, message: Dict[str, Any], session_id: str) -> "AudioPlayResponseEvent":
+        """Create audio play response event from message."""
+        base = Event.from_message(message, session_id)
+        
+        return cls(
+            type=base.type,
+            timestamp=base.timestamp,
+            session_id=base.session_id,
+            data=base.data,
+            request_id=message.get("requestId", ""),
+            success=message.get("success", False),
+            error=message.get("error")
         )

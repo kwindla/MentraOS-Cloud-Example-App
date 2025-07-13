@@ -9,6 +9,7 @@ from .core.app_session import AppSession
 from .core.exceptions import MentraOSError, ConnectionError, AuthenticationError
 from .events.event_types import EventType
 from .layouts.layout_types import ViewType, LayoutType
+from .session.audio import AudioManager, SpeakOptions, VoiceSettings, AudioPlayResult
 
 __version__ = "0.1.0"
 __all__ = [
@@ -19,5 +20,9 @@ __all__ = [
     "AuthenticationError",
     "EventType",
     "ViewType",
-    "LayoutType"
+    "LayoutType",
+    "AudioManager",
+    "SpeakOptions",
+    "VoiceSettings",
+    "AudioPlayResult"
 ]

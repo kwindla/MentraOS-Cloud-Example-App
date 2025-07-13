@@ -8,8 +8,13 @@ from typing import Dict, Optional
 from dotenv import load_dotenv
 
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn
+import aiofiles
+from pathlib import Path
+import numpy as np
+import struct
+import io
 
 from mentraos.utils.logger import get_logger
 from mentraos.utils.config import get_config
@@ -18,6 +23,12 @@ from mentraos.utils.config import get_config
 load_dotenv()
 
 logger = get_logger("pipecat_webhook")
+
+try:
+    import lameenc
+except ImportError:
+    lameenc = None
+    logger.warning("lameenc not installed - /sine endpoint will not work. Install with: pip install lameenc")
 
 
 class PipecatBotManager:
@@ -192,6 +203,374 @@ async def health_check():
         "active_bots": len(bot_manager._processes),
         "package_name": bot_manager._config.package_name
     }
+
+
+# Configurable delay for final byte (in seconds)
+FINAL_BYTE_DELAY = float(os.getenv("FINAL_BYTE_DELAY", "0.1"))  # 100ms default
+
+
+@app.get("/file/{filename}")
+async def send_file_with_delay(filename: str, delay: Optional[float] = None):
+    """Send a file with all but the final byte, delay, then send final byte.
+    
+    This endpoint demonstrates streaming a file with a configurable delay
+    before sending the final byte. Useful for testing streaming behavior.
+    
+    Args:
+        filename: Name of the file to send (must be in current directory)
+        delay: Optional delay override in seconds (default: FINAL_BYTE_DELAY)
+        
+    Returns:
+        StreamingResponse with the file contents
+    """
+    # Use provided delay or default
+    final_byte_delay = delay if delay is not None else FINAL_BYTE_DELAY
+    # Security: Only allow files in current directory, no path traversal
+    file_path = Path(filename).name  # This strips any directory components
+    if not Path(file_path).exists():
+        raise HTTPException(status_code=404, detail=f"File {filename} not found")
+    
+    # Check if it's a regular file
+    if not Path(file_path).is_file():
+        raise HTTPException(status_code=400, detail=f"{filename} is not a file")
+    
+    async def stream_file_with_delay():
+        """Generator that streams file with delay before final byte."""
+        try:
+            async with aiofiles.open(file_path, 'rb') as file:
+                # Read entire file
+                content = await file.read()
+                
+                if len(content) == 0:
+                    # Empty file
+                    logger.warning(f"File {filename} is empty")
+                    return
+                
+                if len(content) == 1:
+                    # Single byte file - wait then send it
+                    logger.info(f"Sending single byte file {filename} after {final_byte_delay}s delay")
+                    await asyncio.sleep(final_byte_delay)
+                    yield content
+                else:
+                    # Send all but final byte
+                    initial_content = content[:-1]
+                    final_byte = content[-1:]
+                    
+                    logger.info(f"Sending {len(initial_content)} bytes of {filename}")
+                    yield initial_content
+                    
+                    # Wait before sending final byte
+                    logger.info(f"Waiting {final_byte_delay}s before sending final byte")
+                    await asyncio.sleep(final_byte_delay)
+                    
+                    logger.info(f"Sending final byte of {filename}")
+                    yield final_byte
+                    
+                logger.info(f"✅ Completed sending {filename} ({len(content)} bytes total)")
+                
+        except Exception as e:
+            logger.error(f"Error streaming file {filename}: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    # Get file size for content-length header
+    file_size = Path(file_path).stat().st_size
+    
+    # Determine media type based on file extension
+    media_type = "application/octet-stream"  # default
+    if file_path.endswith('.txt'):
+        media_type = "text/plain"
+    elif file_path.endswith('.json'):
+        media_type = "application/json"
+    elif file_path.endswith('.html'):
+        media_type = "text/html"
+    elif file_path.endswith('.mp3'):
+        media_type = "audio/mpeg"
+    elif file_path.endswith('.wav'):
+        media_type = "audio/wav"
+    
+    return StreamingResponse(
+        stream_file_with_delay(),
+        media_type=media_type,
+        headers={
+            "Content-Length": str(file_size),
+            "X-Final-Byte-Delay": str(final_byte_delay)
+        }
+    )
+
+
+@app.get("/sine")
+async def generate_sine_mp3(duration: float = 5.0):
+    """Generate an MP3 stream of a 440Hz sine wave.
+    
+    Args:
+        duration: Duration in seconds (default: 5.0)
+        
+    Returns:
+        StreamingResponse with MP3 audio data
+    """
+    if lameenc is None:
+        raise HTTPException(
+            status_code=500, 
+            detail="lameenc not installed. Run: pip install lameenc"
+        )
+    
+    if duration <= 0 or duration > 60:
+        raise HTTPException(
+            status_code=400,
+            detail="Duration must be between 0 and 60 seconds"
+        )
+    
+    # Audio parameters
+    sample_rate = 44100  # Standard CD quality
+    frequency = 440.0    # A4 note
+    channels = 1         # Mono
+    
+    # MP3 encoder setup
+    encoder = lameenc.Encoder()
+    encoder.set_bit_rate(128)  # 128 kbps
+    encoder.set_in_sample_rate(sample_rate)
+    encoder.set_channels(channels)
+    encoder.set_quality(2)  # High quality
+    
+    async def generate_mp3_stream():
+        """Generator that produces MP3 data in real-time."""
+        try:
+            logger.info(f"Starting real-time MP3 sine wave generation: {duration}s at {frequency}Hz")
+            
+            # Calculate total samples
+            total_samples = int(sample_rate * duration)
+            
+            # Generate sine wave in chunks for streaming
+            chunk_duration = 0.1  # 100ms chunks
+            chunk_samples = int(sample_rate * chunk_duration)
+            
+            samples_generated = 0
+            start_time = asyncio.get_event_loop().time()
+            
+            while samples_generated < total_samples:
+                # Track chunk generation start time
+                chunk_start_time = asyncio.get_event_loop().time()
+                
+                # Calculate how many samples to generate in this chunk
+                samples_to_generate = min(chunk_samples, total_samples - samples_generated)
+                
+                # Generate time array for this chunk
+                t_start = samples_generated / sample_rate
+                t_end = (samples_generated + samples_to_generate) / sample_rate
+                t = np.linspace(t_start, t_end, samples_to_generate, endpoint=False)
+                
+                # Generate sine wave
+                sine_wave = np.sin(2 * np.pi * frequency * t)
+                
+                # Scale to 16-bit PCM range
+                pcm_data = (sine_wave * 32767).astype(np.int16)
+                
+                # Encode to MP3
+                mp3_data = encoder.encode(pcm_data.tobytes())
+                
+                if mp3_data:
+                    # Convert bytearray to bytes for Starlette
+                    yield bytes(mp3_data)
+                    logger.debug(f"Generated {len(mp3_data)} bytes of MP3 data")
+                
+                samples_generated += samples_to_generate
+                
+                # Calculate how long this chunk represents in real time
+                chunk_real_duration = samples_to_generate / sample_rate
+                
+                # Calculate how long we've actually taken to generate this chunk
+                chunk_generation_time = asyncio.get_event_loop().time() - chunk_start_time
+                
+                # Sleep for the remaining time to match real-time playback
+                sleep_time = chunk_real_duration - chunk_generation_time
+                if sleep_time > 0:
+                    await asyncio.sleep(sleep_time)
+                    logger.debug(f"Paced: slept {sleep_time:.3f}s to match real-time")
+                else:
+                    logger.warning(f"Generation too slow: took {chunk_generation_time:.3f}s for {chunk_real_duration:.3f}s of audio")
+            
+            # Flush encoder
+            mp3_data = encoder.flush()
+            if mp3_data:
+                # Convert bytearray to bytes for Starlette
+                yield bytes(mp3_data)
+                logger.debug(f"Flushed {len(mp3_data)} bytes of MP3 data")
+            
+            # Calculate total elapsed time
+            total_time = asyncio.get_event_loop().time() - start_time
+            logger.info(f"✅ Completed MP3 generation: {samples_generated} samples in {total_time:.2f}s (target: {duration}s)")
+            
+        except Exception as e:
+            logger.error(f"Error generating MP3: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    return StreamingResponse(
+        generate_mp3_stream(),
+        media_type="audio/mpeg",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Audio-Duration": str(duration),
+            "X-Audio-Frequency": str(frequency)
+        }
+    )
+
+
+@app.get("/audio-stream/{filename}")
+async def stream_audio_file(filename: str):
+    """Stream audio file as MP3, with support for files being generated in real-time.
+    
+    Args:
+        filename: Stem of the file in audio-generation directory
+        
+    Returns:
+        StreamingResponse with MP3 audio data
+    """
+    if lameenc is None:
+        raise HTTPException(
+            status_code=500, 
+            detail="lameenc not installed. Run: pip install lameenc"
+        )
+    
+    # Sanitize filename to prevent path traversal
+    safe_filename = Path(filename).name
+    audio_dir = Path("audio-generation")
+    
+    # Check for completed file first
+    completed_file = audio_dir / safe_filename
+    generating_file = audio_dir / f"{safe_filename}.generating"
+    
+    # Audio parameters for 16kHz 16-bit mono WAV
+    sample_rate = 16000
+    channels = 1
+    bytes_per_sample = 2  # 16-bit
+    
+    # MP3 encoder setup for 64kbps
+    encoder = lameenc.Encoder()
+    encoder.set_bit_rate(64)  # 64 kbps as requested
+    encoder.set_in_sample_rate(sample_rate)
+    encoder.set_channels(channels)
+    encoder.set_quality(2)  # High quality
+    
+    async def stream_mp3():
+        """Generator that produces MP3 data from WAV file."""
+        bytes_read = 0
+        
+        try:
+            # Case 1: Completed file exists
+            if completed_file.exists() and completed_file.is_file():
+                logger.info(f"Streaming completed file: {completed_file}")
+                
+                async with aiofiles.open(completed_file, 'rb') as f:
+                    # Read and encode in chunks
+                    chunk_size = sample_rate * bytes_per_sample  # 1 second chunks
+                    
+                    while True:
+                        wav_data = await f.read(chunk_size)
+                        if not wav_data:
+                            break
+                        
+                        # Ensure we have an even number of bytes for 16-bit samples
+                        if len(wav_data) % 2 != 0:
+                            wav_data = wav_data[:-1]
+                        
+                        # Encode to MP3
+                        mp3_data = encoder.encode(wav_data)
+                        if mp3_data:
+                            yield bytes(mp3_data)
+                    
+                    # Flush encoder
+                    mp3_data = encoder.flush()
+                    if mp3_data:
+                        yield bytes(mp3_data)
+                        
+                logger.info(f"✅ Completed streaming {completed_file}")
+                return
+            
+            # Case 2: Generating file exists
+            elif generating_file.exists() and generating_file.is_file():
+                logger.info(f"Streaming generating file: {generating_file}")
+                
+                # Stream the file as it's being generated
+                file_handle = await aiofiles.open(generating_file, 'rb')
+                
+                try:
+                    while True:
+                        # Read any new data
+                        await file_handle.seek(bytes_read)
+                        wav_data = await file_handle.read(8192)  # Read up to 8KB at a time
+                        
+                        if wav_data:
+                            bytes_read += len(wav_data)
+                            
+                            # Ensure we have an even number of bytes for 16-bit samples
+                            if len(wav_data) % 2 != 0:
+                                wav_data = wav_data[:-1]
+                                bytes_read -= 1
+                            
+                            # Encode to MP3
+                            mp3_data = encoder.encode(wav_data)
+                            if mp3_data:
+                                yield bytes(mp3_data)
+                                logger.debug(f"Sent {len(mp3_data)} MP3 bytes (read {bytes_read} WAV bytes total)")
+                        
+                        # Check if generating file still exists
+                        if not generating_file.exists():
+                            logger.info(f"Generating file disappeared, checking for completed file")
+                            break
+                        
+                        # Sleep to pace the streaming
+                        await asyncio.sleep(0.1)
+                    
+                finally:
+                    await file_handle.close()
+                
+                # Check if completed file now exists with more data
+                if completed_file.exists() and completed_file.is_file():
+                    file_size = completed_file.stat().st_size
+                    if file_size > bytes_read:
+                        logger.info(f"Reading final {file_size - bytes_read} bytes from completed file")
+                        
+                        async with aiofiles.open(completed_file, 'rb') as f:
+                            await f.seek(bytes_read)
+                            remaining_data = await f.read()
+                            
+                            if remaining_data:
+                                # Ensure even number of bytes
+                                if len(remaining_data) % 2 != 0:
+                                    remaining_data = remaining_data[:-1]
+                                
+                                # Encode final data
+                                mp3_data = encoder.encode(remaining_data)
+                                if mp3_data:
+                                    yield bytes(mp3_data)
+                
+                # Flush encoder
+                mp3_data = encoder.flush()
+                if mp3_data:
+                    yield bytes(mp3_data)
+                    
+                logger.info(f"✅ Completed streaming {safe_filename} ({bytes_read} WAV bytes total)")
+            
+            else:
+                # Neither file exists
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"File not found: {safe_filename} or {safe_filename}.generating"
+                )
+                
+        except Exception as e:
+            logger.error(f"Error streaming audio file {filename}: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    return StreamingResponse(
+        stream_mp3(),
+        media_type="audio/mpeg",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Audio-Source": str(safe_filename),
+            "X-Audio-Format": "16kHz 16-bit mono WAV to 64kbps MP3"
+        }
+    )
 
 
 @app.on_event("shutdown")

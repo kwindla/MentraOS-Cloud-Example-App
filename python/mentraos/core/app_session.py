@@ -8,6 +8,7 @@ from .websocket_client import WebSocketClient
 from ..events.event_manager import EventManager
 from ..events.event_types import EventType
 from ..layouts.layout_manager import LayoutManager
+from ..session.audio import AudioManager
 from ..protocol.messages import (
     ConnectionInitMessage,
     SubscriptionUpdateMessage,
@@ -43,9 +44,16 @@ class AppSession:
         self.websocket_url = websocket_url
         self.server = server
         
+        # Extract server URL from websocket URL
+        # Convert wss://example.com/app-ws to https://example.com
+        self.server_url = websocket_url.replace("wss://", "https://").replace("ws://", "http://")
+        if "/app-ws" in self.server_url:
+            self.server_url = self.server_url.replace("/app-ws", "")
+        
         # Components
         self.events = EventManager()
         self.layouts = LayoutManager(self)
+        self.audio = AudioManager(self)
         self._subscriptions = SubscriptionManager()
         
         # WebSocket client
@@ -184,6 +192,19 @@ class AppSession:
                 # Trigger disconnect
                 await self.stop()
                 return
+            
+            # Handle audio play response
+            if data.get("type") == "audio_play_response":
+                logger.info(f"📢 Received AUDIO_PLAY_RESPONSE: requestId={data.get('requestId')}, success={data.get('success')}")
+                logger.debug(f"Full audio play response: {data}")
+                # Emit the event
+                await self.events.emit_from_message(data, self.session_id)
+                return
+            
+            # Log all unknown message types for debugging
+            message_type = data.get("type", "unknown")
+            if message_type not in ["data_stream", "binary", "connection_ack", "app_stopped"]:
+                logger.debug(f"📨 Received message type '{message_type}': {data}")
             
             # For other message types, emit as event
             await self.events.emit_from_message(data, self.session_id)
