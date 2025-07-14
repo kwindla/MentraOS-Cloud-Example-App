@@ -5,6 +5,7 @@ import asyncio
 import os
 import sys
 import argparse
+import aiohttp
 
 from loguru import logger
 from dotenv import load_dotenv
@@ -20,14 +21,14 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask, PipelineParams
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.openai import OpenAILLMService
-from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.processors.aggregators.openai_llm_context import (
     OpenAILLMContext,
     OpenAILLMContextFrame,
 )
-
+from pipecat.services.speechmatics.stt import SpeechmaticsSTTService
+from pipecat.transcriptions.language import Language
+from pipecat.services.elevenlabs.tts import ElevenLabsHttpTTSService
 
 # Add parent directory to path to import mentraos module
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -94,120 +95,117 @@ async def run_bot(
     logger.info(f"🔌 WebSocket URL: {websocket_url}")
 
     try:
-        # Get API keys
-        deepgram_api_key = os.getenv("DEEPGRAM_API_KEY")
+        speechmatics_api_key = os.getenv("SPEECHMATICS_API_KEY")
         openai_api_key = os.getenv("OPENAI_API_KEY")
-        cartesia_api_key = os.getenv("CARTESIA_API_KEY")
+        elevenlabs_api_key = os.getenv("ELEVENLABS_API_KEY")
 
-        if not deepgram_api_key:
-            logger.error("❌ DEEPGRAM_API_KEY not set in environment")
+        if not speechmatics_api_key:
+            logger.error("❌ SPEECHMATICS_API_KEY not set in environment")
             return
         if not openai_api_key:
             logger.error("❌ OPENAI_API_KEY not set in environment")
             return
-        if not cartesia_api_key:
-            logger.error("❌ CARTESIA_API_KEY not set in environment")
+        if not elevenlabs_api_key:
+            logger.error("❌ ELEVENLABS_API_KEY not set in environment")
             return
 
-        # Create MentraOS transport
-        transport = MentraOSWebSocketTransport(
-            websocket_url=websocket_url,
-            session_id=session_id,
-            api_key=mentra_api_key,
-            package_name=package_name,
-            vad_analyzer=SileroVADAnalyzer(),
-            bot_stopped_speaking_delay=2.5,  # MentraOS requires ~2.5s to start audio playback
-        )
+        async with aiohttp.ClientSession() as session:
+            # Create MentraOS transport
+            transport = MentraOSWebSocketTransport(
+                websocket_url=websocket_url,
+                session_id=session_id,
+                api_key=mentra_api_key,
+                package_name=package_name,
+                vad_analyzer=SileroVADAnalyzer(),
+                bot_stopped_speaking_delay=2.0,  # MentraOS requires ~2s to start audio playback
+            )
 
-        # Set up LLM with initial system message
-        messages = [
-            {
-                "role": "system",
-                "content": "You are a helpful AI assistant on smart glasses. "
-                "Keep your responses brief and conversational. "
-                "Maximum 2-3 sentences per response.",
-            }
-        ]
-
-        # Create STT service
-        stt = DeepgramSTTService(
-            api_key=deepgram_api_key,
-            language="en-US",
-            model="nova-2",
-            sample_rate=16000,
-            channels=1,
-            interim_results=True,
-            endpointing=300,
-            smart_format=True,
-            encoding="linear16",
-        )
-
-        stt_mute_filter = STTMuteFilter(config=STTMuteConfig(strategies={STTMuteStrategy.ALWAYS}))
-
-        llm = OpenAILLMService(api_key=openai_api_key)
-        tts = CartesiaTTSService(
-            api_key=cartesia_api_key,
-            voice_id="71a7ad14-091c-4e8e-a314-022ece01c121",  # British Reading Lady
-        )
-        user_transcription_handler = UserTranscriptionHandler()
-        # Create a placeholder for the handler - will set app_session after transport is ready
-        assistant_response_handler = AssistantResponseHandler(None)
-        context = OpenAILLMContext(messages)
-        context_aggregator = llm.create_context_aggregator(
-            context,
-            # need to set expect_stripped_words if the assistant aggregator is before the transport output.
-            # assistant_params=LLMAssistantAggregatorParams(expect_stripped_words=False),
-        )
-
-        # Build pipeline
-        pipeline = Pipeline(
-            [
-                transport.input(),
-                stt_mute_filter,
-                stt,
-                user_transcription_handler,
-                context_aggregator.user(),
-                llm,
-                tts,
-                transport.output(),
-                context_aggregator.assistant(),
-                assistant_response_handler,
+            # Set up LLM with initial system message
+            messages = [
+                {
+                    "role": "system",
+                    "content": "You are a helpful AI assistant on smart glasses. "
+                    "Keep your responses brief and conversational. "
+                    "Maximum 2-3 sentences per response.",
+                }
             ]
-        )
 
-        task = PipelineTask(
-            pipeline,
-            params=PipelineParams(
-                enable_metrics=True,
-                enable_usage_metrics=True,
-                observers=[
-                    # LMLogObserver()
-                ],
-            ),
-        )
+            stt = SpeechmaticsSTTService(
+                api_key=speechmatics_api_key,
+                language=Language.EN,
+                # enable_speaker_diarization=True,
+                # text_format="<{speaker_id}>{text}</{speaker_id}>",
+            )
 
-        @transport.event_handler("on_client_connected")
-        async def on_client_connected(transport, app_session):
-            logger.info("🎉 Client connected to MentraOS")
-            # Set the app_session on the assistant response handler
-            assistant_response_handler._app_session = app_session
+            stt_mute_filter = STTMuteFilter(
+                config=STTMuteConfig(strategies={STTMuteStrategy.ALWAYS})
+            )
 
-            # Register audio play response handler
-            @app_session.events.on_audio_play_response
-            async def handle_audio_response(event):
-                logger.info(
-                    f"🔊 AUDIO RESPONSE EVENT: requestId={event.request_id}, success={event.success}"
-                )
-                if not event.success and event.error:
-                    logger.error(f"  Error: {event.error}")
+            llm = OpenAILLMService(api_key=openai_api_key)
+            tts = ElevenLabsHttpTTSService(
+                api_key=elevenlabs_api_key,
+                voice_id="N2lVS1w4EtoT3dr4eOWO",
+                aiohttp_session=session,
+            )
+            user_transcription_handler = UserTranscriptionHandler()
+            # Create a placeholder for the handler - will set app_session after transport is ready
+            assistant_response_handler = AssistantResponseHandler(None)
+            context = OpenAILLMContext(messages)
+            context_aggregator = llm.create_context_aggregator(
+                context,
+                # need to set expect_stripped_words if the assistant aggregator is before the transport output.
+                # assistant_params=LLMAssistantAggregatorParams(expect_stripped_words=False),
+            )
 
-            # Don't send initial context frame - wait for user to speak first
-            # await task.queue_frames([context_aggregator.user().get_context_frame()])
+            # Build pipeline
+            pipeline = Pipeline(
+                [
+                    transport.input(),
+                    stt_mute_filter,
+                    stt,
+                    user_transcription_handler,
+                    context_aggregator.user(),
+                    llm,
+                    tts,
+                    transport.output(),
+                    context_aggregator.assistant(),
+                    assistant_response_handler,
+                ]
+            )
 
-        logger.info(f"🎯 Pipeline running for session {session_id}")
-        runner = PipelineRunner(handle_sigint=True)
-        await runner.run(task)
-        logger.info(f"✅ Pipeline completed for session {session_id}")
+            task = PipelineTask(
+                pipeline,
+                params=PipelineParams(
+                    enable_metrics=True,
+                    enable_usage_metrics=True,
+                    observers=[
+                        # LMLogObserver()
+                    ],
+                ),
+            )
+
+            @transport.event_handler("on_client_connected")
+            async def on_client_connected(transport, app_session):
+                logger.info("🎉 Client connected to MentraOS")
+                # Set the app_session on the assistant response handler
+                assistant_response_handler._app_session = app_session
+
+                # Register audio play response handler
+                @app_session.events.on_audio_play_response
+                async def handle_audio_response(event):
+                    logger.info(
+                        f"🔊 AUDIO RESPONSE EVENT: requestId={event.request_id}, success={event.success}"
+                    )
+                    if not event.success and event.error:
+                        logger.error(f"  Error: {event.error}")
+
+                # Don't send initial context frame - wait for user to speak first
+                # await task.queue_frames([context_aggregator.user().get_context_frame()])
+
+            logger.info(f"🎯 Pipeline running for session {session_id}")
+            runner = PipelineRunner(handle_sigint=True)
+            await runner.run(task)
+            logger.info(f"✅ Pipeline completed for session {session_id}")
 
     except Exception as e:
         logger.error(f"❌ Bot error: {e}")
@@ -227,14 +225,6 @@ def main():
     parser.add_argument("--package-name", required=True, help="Package name")
 
     args = parser.parse_args()
-
-    # Check for required environment variables
-    if not os.getenv("DEEPGRAM_API_KEY"):
-        logger.error("❌ Please set DEEPGRAM_API_KEY in your .env file")
-        sys.exit(1)
-    if not os.getenv("OPENAI_API_KEY"):
-        logger.error("❌ Please set OPENAI_API_KEY in your .env file")
-        sys.exit(1)
 
     # Run the bot
     try:
