@@ -1,6 +1,7 @@
-pipecat-ai[webrtc,daily,silero,openai,deepgram,cartesia]===0.0.76
+pipecat-ai[webrtc,daily,silero,openai,speechmatics,elevenlabs]===0.0.76
 python-dotenv
 fastapi
 uvicorn
+
 
 
